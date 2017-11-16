@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/deciphernow/gm-fabric-go/middleware"
 	"github.com/gorilla/mux"
@@ -48,6 +48,7 @@ func WithNats(conn *nats.EncodedConn) middleware.Middleware {
 	return middleware.MiddlewareFunc(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
+			r = r.WithContext(context.WithValue(r.Context(), natsKey, conn))
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -64,8 +65,14 @@ func GetNatsConn(ctx context.Context) (*nats.EncodedConn, error) {
 }
 
 func main() {
-	nc, _ := nats.Connect(nats.DefaultURL)
-	c, _ := nats.NewEncodedConn(nc, nats.JSON_ENCODER)
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	c, err := nats.NewEncodedConn(nc, nats.JSON_ENCODER)
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer c.Close()
 
 	stack := middleware.Chain(
@@ -75,13 +82,14 @@ func main() {
 	mux := mux.NewRouter()
 
 	mux.HandleFunc("/subscribe", Subscribe)
-	mux.HandleFunc("/send", Send).Methods("POST")
+	mux.HandleFunc("/send", Send)
 
 	s := http.Server{
 		Addr:    ":8080",
 		Handler: stack.Wrap(mux),
 	}
 
+	log.Println("Messenger listening on :8080")
 	s.ListenAndServe()
 }
 
@@ -106,11 +114,7 @@ func Subscribe(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		m := <-ch
-		b, err := json.MarshalIndent(m, "", "    ")
-		if err != nil {
-			log.Fatal(err)
-		}
-		err = c.WriteJSON(b)
+		err = c.WriteJSON(m)
 		if err != nil {
 			log.Println(err)
 		}
@@ -139,7 +143,9 @@ func Send(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Println(err)
 		}
-
+		m.Timestamp = time.Now().Format(time.RFC3339)
+		fmt.Println("Sent:")
+		fmt.Println(m)
 		ch := make(chan *Message)
 		ec.BindSendChan("message", ch)
 
