@@ -12,9 +12,5 @@ A basic messenger app that uses NATS.io and Websockets as the underlying publish
 2. Build the messenger binary
 ```
 dep ensure -v
-go build
-```
-3. Run the binary
-```
-./messenger
+docker-compose up --build
 ```

@@ -1,155 +1,78 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"log"
 	"net/http"
+	"os"
 	"time"
 
+	mgo "gopkg.in/mgo.v2"
+
+	"github.com/alecholmez/messenger/config"
+	"github.com/alecholmez/messenger/sockets"
+	"github.com/alecholmez/messenger/users"
+	"github.com/deciphernow/gm-fabric-go/dbutil"
 	"github.com/deciphernow/gm-fabric-go/middleware"
 	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
 	nats "github.com/nats-io/go-nats"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/hlog"
 )
-
-// Message ...
-type Message struct {
-	Timestamp string `json:"timestamp"`
-	Message   string `json:"message"`
-	User      User   `json:"user"`
-}
-
-// User ...
-type User struct {
-	Name     string `json:"name"`
-	Username string `json:"username"`
-	Email    string `json:"email"`
-}
-
-type key int
-
-const (
-	natsKey key = iota
-)
-
-var (
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			fmt.Println(r.Header.Get("Origin"))
-			return true
-		},
-	}
-)
-
-// WithNats ...
-func WithNats(conn *nats.EncodedConn) middleware.Middleware {
-	return middleware.MiddlewareFunc(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-			r = r.WithContext(context.WithValue(r.Context(), natsKey, conn))
-			next.ServeHTTP(w, r)
-		})
-	})
-}
-
-// GetNatsConn ...
-func GetNatsConn(ctx context.Context) (*nats.EncodedConn, error) {
-	conn, ok := ctx.Value(natsKey).(*nats.EncodedConn)
-	if !ok {
-		return nil, errors.New("Failed to retrieve nats connection")
-	}
-
-	return conn, nil
-}
 
 func main() {
-	nc, err := nats.Connect(nats.DefaultURL)
+	log := zerolog.New(os.Stderr).With().Timestamp().Logger().
+		Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
+	// Read in config
+	sc := config.NewConfig()
+
+	nc, err := nats.Connect(sc.NatsIP)
 	if err != nil {
-		log.Fatal(err)
+		log.Error().Err(err).Msg("Failed to connect to NATS")
+		return
 	}
+
 	c, err := nats.NewEncodedConn(nc, nats.JSON_ENCODER)
 	if err != nil {
-		log.Fatal(err)
+		log.Error().Err(err).Msg("Failed to create encoded NATS conn")
 	}
 	defer c.Close()
 
+	sess, err := mgo.Dial(sc.MongoIP)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to connect to Mongo")
+		return
+	}
+	defer sess.Close()
+
 	stack := middleware.Chain(
-		WithNats(c),
+		middleware.MiddlewareFunc(hlog.NewHandler(log)),
+		middleware.MiddlewareFunc(hlog.AccessHandler(func(r *http.Request, status int, size int, duration time.Duration) {
+			hlog.FromRequest(r).Info().
+				Str("method", r.Method).
+				Str("path", r.URL.String()).
+				Int("status", status).
+				Int("size", size).
+				Dur("duration", duration).
+				Msg("Access")
+		})),
+		middleware.MiddlewareFunc(hlog.UserAgentHandler("user_agent")),
+		config.WithNats(c),
+		dbutil.WithMongo(sess),
 	)
 
 	mux := mux.NewRouter()
 
-	mux.HandleFunc("/subscribe", Subscribe)
-	mux.HandleFunc("/send", Send)
+	mux.HandleFunc("/subscribe", sockets.Subscribe)
+	mux.HandleFunc("/send", sockets.Send)
+	mux.HandleFunc("/signup", users.Signup).Methods("POST")
+	mux.HandleFunc("/login", users.Login).Methods("POST")
 
 	s := http.Server{
 		Addr:    ":8080",
 		Handler: stack.Wrap(mux),
 	}
 
-	log.Println("Messenger listening on :8080")
+	log.Info().Msg("Messenger listening on :8080")
+	// Block on this
 	s.ListenAndServe()
-}
-
-// Subscribe ...
-func Subscribe(w http.ResponseWriter, r *http.Request) {
-	// Upgrade web handler to a websocket connection
-	c, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Failed to upgrade http connection: " + err.Error())
-		return
-	}
-	defer c.Close()
-
-	ec, err := GetNatsConn(r.Context())
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	ch := make(chan *Message)
-	ec.BindRecvChan("message", ch)
-
-	for {
-		m := <-ch
-		err = c.WriteJSON(m)
-		if err != nil {
-			log.Println(err)
-		}
-	}
-}
-
-// Send ...
-func Send(w http.ResponseWriter, r *http.Request) {
-	// Upgrade web handler to a websocket connection
-	c, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Failed to upgrade http connection: " + err.Error())
-		return
-	}
-	defer c.Close()
-
-	ec, err := GetNatsConn(r.Context())
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	for {
-		var m Message
-		err := c.ReadJSON(&m)
-		if err != nil {
-			log.Println(err)
-		}
-		m.Timestamp = time.Now().Format(time.RFC3339)
-		fmt.Println("Sent:")
-		fmt.Println(m)
-		ch := make(chan *Message)
-		ec.BindSendChan("message", ch)
-
-		ch <- &m
-	}
-
 }
