@@ -16,6 +16,10 @@ services:
 
     nats:
         image: nats:latest
+        ports:
+            - "8222:8222"
+        expose:
+            - 8222
 
     mongo:
         image: mongo:latest
